@@ -2,6 +2,7 @@
 # ruff: noqa: F841
 
 import itertools
+import operator
 import torch
 import os
 import numpy as np
@@ -2458,6 +2459,129 @@ class TestMetaKernelRegistrations(TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Expected out tensor to have dtype"):
             op(inp, other, out=out)
+
+    def _run_shift(self, mode, shift, lhs, rhs):
+        # Runs `lhs <shift> rhs` eagerly, on meta tensors, or on FakeTensors.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        op = getattr(operator, shift)
+        if mode == "eager":
+            return op(lhs, rhs)
+        if mode == "meta":
+            return op(
+                *[
+                    x.to("meta") if isinstance(x, torch.Tensor) else x
+                    for x in (lhs, rhs)
+                ]
+            )
+        with FakeTensorMode() as fake_mode:
+            return op(
+                *[
+                    fake_mode.from_tensor(x) if isinstance(x, torch.Tensor) else x
+                    for x in (lhs, rhs)
+                ]
+            )
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    @parametrize("shift", ["lshift", "rshift"])
+    @parametrize("case", ["bool_python_int", "bool_int32", "int32_bool"])
+    def test_shift_bool_promotion_matches_eager(self, shift, case):
+        # https://github.com/pytorch/pytorch/issues/202731
+        # Eager promotes bool operands before shifting (bool << 1 is int64,
+        # bool << int32 is int32); meta/FakeTensor must agree rather than
+        # reject bool.
+        bool_t = torch.tensor([True, False])
+        int32_t = torch.ones(2, dtype=torch.int32)
+        lhs, rhs, dtype = {
+            "bool_python_int": (bool_t, 1, torch.int64),
+            "bool_int32": (bool_t, int32_t, torch.int32),
+            "int32_bool": (int32_t, bool_t, torch.int32),
+        }[case]
+        eager = self._run_shift("eager", shift, lhs, rhs)
+        self.assertEqual(eager.dtype, dtype)
+        for mode in ("meta", "fake"):
+            result = self._run_shift(mode, shift, lhs, rhs)
+            self.assertEqual(result.dtype, eager.dtype, msg=mode)
+            self.assertEqual(result.shape, eager.shape, msg=mode)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    @parametrize("shift", ["lshift", "rshift"])
+    @parametrize(
+        "case",
+        [
+            "bool_bool_tensor",
+            "bool_python_bool",
+            "float_input",
+            "float_tensor_shift",
+            "float_python_shift",
+        ],
+    )
+    def test_shift_non_integral_promotion_rejected(self, shift, case):
+        # Accepting bool must not let operands through whose promoted dtype is
+        # not integral: eager has no kernel for them either.
+        bool_t = torch.tensor([True, False])
+        int_t = torch.tensor([4, 8])
+        float_t = torch.tensor([1.0, 2.0])
+        lhs, rhs = {
+            "bool_bool_tensor": (bool_t, bool_t),
+            "bool_python_bool": (bool_t, True),
+            "float_input": (float_t, 1),
+            "float_tensor_shift": (int_t, float_t),
+            "float_python_shift": (int_t, 1.5),
+        }[case]
+        with self.assertRaisesRegex(RuntimeError, "not implemented"):
+            self._run_shift("eager", shift, lhs, rhs)
+        for mode in ("meta", "fake"):
+            with self.assertRaisesRegex(RuntimeError, "integral dtype|to be an int"):
+                self._run_shift(mode, shift, lhs, rhs)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    @parametrize("shift", ["lshift", "rshift"])
+    @parametrize("other_kind", ["Scalar", "Tensor"])
+    def test_shift_out_bool_input(self, shift, other_kind):
+        # Eager requires `out` to have the promoted dtype (int64), not bool.
+        op_packet = getattr(torch.ops.aten, f"__{shift}__")
+        op = getattr(op_packet, f"{other_kind}_out")
+
+        for device in ("cpu", "meta"):
+            inp = torch.tensor([True, False], device=device)
+            other = (
+                1 if other_kind == "Scalar" else torch.ones_like(inp, dtype=torch.int64)
+            )
+            out = torch.empty(2, dtype=torch.int64, device=device)
+            self.assertIs(op(inp, other, out=out), out)
+            self.assertEqual(out.dtype, torch.int64)
+            bool_out = torch.empty(2, dtype=torch.bool, device=device)
+            with self.assertRaisesRegex(
+                RuntimeError, "Expected out tensor to have dtype"
+            ):
+                op(inp, other, out=bool_out)
+
+    @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
+    @parametrize("shift", ["lshift", "rshift"])
+    def test_shift_inplace_dtype(self, shift):
+        # Integer in-place shifts keep their dtype; eager rejects in-place
+        # bool shifts because the int64 result cannot be cast back to bool.
+        op = getattr(operator, f"i{shift}")
+        int_t = torch.tensor([4, 8], dtype=torch.int32)
+        self.assertEqual(op(int_t.clone(), 1).dtype, torch.int32)
+        self.assertEqual(op(int_t.to("meta"), 1).dtype, torch.int32)
+
+        # bool in-place shifts must stay rejected on meta and FakeTensor too,
+        # now that shift_dtype_check accepts bool operands.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        bool_t = torch.tensor([True, False])
+        with self.assertRaisesRegex(RuntimeError, "can't be cast"):
+            op(bool_t.clone(), 1)
+        with self.assertRaisesRegex(RuntimeError, "can't be cast"):
+            op(bool_t.to("meta"), 1)
+        with self.assertRaisesRegex(RuntimeError, "can't be cast"):
+            op(bool_t.to("meta"), torch.ones(2, dtype=torch.int32, device="meta"))
+        with FakeTensorMode() as mode:
+            fake = mode.from_tensor(bool_t)
+            with self.assertRaisesRegex(RuntimeError, "can't be cast"):
+                op(fake, 1)
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_aminmax_out_dtype_mismatch(self):

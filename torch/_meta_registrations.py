@@ -4962,13 +4962,17 @@ def meta_round(self, **kwargs):
 
 
 def shift_dtype_check(fn_name, self, val):
+    # Eager promotes bool operands before running its integral-only kernel
+    # (e.g. bool_tensor << 1 is int64), so bool is accepted as long as the
+    # promoted dtype is integral. bool with bool still promotes to bool and is
+    # rejected below, as are floating point operands.
     torch._check(
-        utils.is_integer_dtype(self.dtype),
+        utils.is_integer_dtype(self.dtype) or utils.is_boolean_dtype(self.dtype),
         lambda: f"{fn_name}: Expected input tensor to have an integral dtype. Got {self.dtype}",
     )
     if isinstance(val, torch.Tensor):
         torch._check(
-            utils.is_integer_dtype(val.dtype),
+            utils.is_integer_dtype(val.dtype) or utils.is_boolean_dtype(val.dtype),
             lambda: f"{fn_name}: Expected shift value to have an integral dtype. Got {val.dtype}",
         )
     else:
@@ -4976,6 +4980,14 @@ def shift_dtype_check(fn_name, self, val):
             isinstance(val, IntLike),
             lambda: f"{fn_name}: Expected shift value to be an int. Got {val}",
         )
+    _, result_dtype = utils.elementwise_dtypes(
+        self, val, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    )
+    torch._check(
+        utils.is_integer_dtype(result_dtype),
+        lambda: f"{fn_name}: Expected input tensor and shift value to promote to an integral dtype. Got {result_dtype}",
+    )
+    return result_dtype
 
 
 @register_meta(
@@ -5008,6 +5020,32 @@ def meta_lshifts(self, other):
     return elementwise_meta(
         self, other, type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
     )
+
+
+def _shift_inplace_meta(fn_name, self, other):
+    # shift_dtype_check now lets bool operands through, so reject results that
+    # cannot be written back to self (e.g. bool_tensor >>= 1), as eager does.
+    result_dtype = shift_dtype_check(fn_name, self, other)
+    torch._check(
+        utils.can_safe_cast_to(cast_from=result_dtype, cast_to=self.dtype),
+        lambda: (
+            f"result type {result_dtype} can't be cast to the desired "
+            f"output type {self.dtype}"
+        ),
+    )
+    if isinstance(other, torch.Tensor):
+        check_inplace_broadcast(self.shape, other.shape)
+    return self
+
+
+@register_meta([aten.__irshift__.Scalar, aten.__irshift__.Tensor])
+def meta_irshifts(self, other):
+    return _shift_inplace_meta("rshift", self, other)
+
+
+@register_meta([aten.__ilshift__.Scalar, aten.__ilshift__.Tensor])
+def meta_ilshifts(self, other):
+    return _shift_inplace_meta("lshift", self, other)
 
 
 @register_meta(aten.zero.default)

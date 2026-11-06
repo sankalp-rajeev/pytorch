@@ -9305,6 +9305,46 @@ SavedForBackwardsAOTOutput(idx=5)""",
         self.assertEqual(opt_fn(inp2, grid2), fn(inp2, grid2))
         self.assertEqual(cnt.frame_count, 1)
 
+    @parametrize("shift", ["lshift", "rshift"])
+    def test_bool_tensor_shift_python_int(self, shift):
+        # https://github.com/pytorch/pytorch/issues/202731
+        # Eager promotes `bool_tensor << 1` / `>> 1` to int64; fake tensor
+        # propagation used to reject bool and fail under torch.compile.
+        fn = {"lshift": lambda t: t << 1, "rshift": lambda t: t >> 1}[shift]
+        t = torch.tensor([True, False])
+        expected = fn(t)
+        self.assertEqual(expected.dtype, torch.int64)
+
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        actual = opt_fn(t)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual.dtype, expected.dtype)
+
+    @parametrize("shift", ["lshift", "rshift"])
+    def test_bool_int_tensor_shift(self, shift):
+        # https://github.com/pytorch/pytorch/issues/202731
+        fn = {"lshift": lambda a, b: a << b, "rshift": lambda a, b: a >> b}[shift]
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        bool_t = torch.tensor([True, False])
+        int_t = torch.ones(2, dtype=torch.int32)
+        for a, b in ((bool_t, int_t), (int_t, bool_t)):
+            expected = fn(a, b)
+            actual = opt_fn(a, b)
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual.dtype, expected.dtype)
+
+    @parametrize("shift", ["lshift", "rshift"])
+    def test_bool_bool_tensor_shift_still_errors(self, shift):
+        # There is no bool shift kernel, so eager errors; torch.compile must not
+        # accept it just because bool tensors can be shifted by an int.
+        fn = {"lshift": lambda a, b: a << b, "rshift": lambda a, b: a >> b}[shift]
+        t = torch.tensor([True, False])
+        with self.assertRaises(RuntimeError):
+            fn(t, t)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        with self.assertRaises(RuntimeError):
+            opt_fn(t, t)
+
 
 class ReproTestsDevice(torch._dynamo.test_case.TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
